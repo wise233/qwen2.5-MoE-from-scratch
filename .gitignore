@@ -1,0 +1,25 @@
+# ---------- 数据（体积大，不入库） ----------
+fineweb-edu/
+*.bin
+*.parquet
+data/
+
+# ---------- 训练输出 / 检查点 ----------
+out-qwen-moe/
+out-qwen-moe-tiny/
+*.ckpt
+*.pt
+*.safetensors
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+*.egg-info/
+
+# ---------- 工具 / IDE / 系统 ----------
+.claude/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
