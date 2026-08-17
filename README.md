@@ -4,7 +4,7 @@
   <img src="Qwen2.5-MoE.jpg" alt="Qwen2.5-MoE" width="820">
 </p>
 
-基于 **Qwen2.5-0.5B** 的纯 PyTorch 实现，借鉴 **DeepSeek-V3** 的 MoE 架构改造成的混合专家语言模型。本项目将包含大模型的架构定义、预训练、微调（SFT、DPO）、知识蒸馏、多模态的全链路脚本文件。
+基于 **Qwen2.5-0.5B** 的纯 PyTorch 实现，借鉴 DeepSeek-V3 的 MoE 架构改造成的混合专家语言模型。**本项目将包含大模型的架构定义、预训练、微调（SFT、DPO）、知识蒸馏、多模态的全链路脚本文件。**
 
 - **零外部依赖**：不依赖 `transformers`、LlamaFactory，只用 `torch`，便于独立运行、学习和部署
 - **前沿架构选择**：GQA + RoPE + FlashAttention
@@ -36,7 +36,7 @@
 │   └── hellaswag_qwen2.py       # HellaSwag 评测脚本
 ├── configs/              # DeepSpeed 配置
 │   ├── ds_config.json           # 预训练（正式）
-│   ├── ds_config_tiny.json      # 预训练（超小冒烟）
+│   ├── ds_config_tiny.json      # 预训练（测试）
 │   ├── ds_config_sft.json       # SFT
 │   └── ds_config_dpo.json       # DPO
 ├── docs/                 # 文档
@@ -47,8 +47,6 @@
 ```
 
 ## 快速开始
-
-> 以下命令都在**仓库根目录**下执行（`data/`、`saves/` 等相对路径都以根目录为基准）。
 
 ```bash
 # 1. 环境
@@ -79,13 +77,9 @@ deepspeed --num_gpus=1 scripts/finetune_qwen_moe.py --stage sft \
 
 | 组件 | 配置 |
 |------|------|
-| 在Hellaswag上微调（SFT → DPO） | ✅ 自写脚本，见 [docs/FINETUNE_README.md](docs/FINETUNE_README.md) |
-| 蒸馏 DeepSeek-R1 | × |
-| 为模型添加视觉头与投影层 | × |
-| 最大序列 | × |
-| 前馈 | × |
-| MoE | × |
-| 参数量 | × |
+| 在Hellaswag上微调（SFT → DPO） | ✅ |
+| 蒸馏 DeepSeek-R1 | ❌ |
+| 为模型添加视觉头与投影层 | ❌ |
 
 ## 参考
 
