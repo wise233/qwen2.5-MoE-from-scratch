@@ -14,8 +14,8 @@ fineweb-edu -> tokens -> .bin
     val.bin    —— 最后 val_frac 比例的 token
     meta.json  —— tokenizer / 词表 / token 数等元信息
 
-用法：
-    python prepare_fineweb.py [--data_dir fineweb-edu] [--out_dir fineweb-edu/bin]
+用法（在仓库根目录下执行）：
+    python scripts/prepare_fineweb.py [--data_dir fineweb-edu] [--out_dir fineweb-edu/bin]
                              [--tokenizer Qwen/Qwen2.5-0.5B] [--val_frac 0.01]
                              [--batch_size 2000] [--limit -1] [--with_eos]
 """

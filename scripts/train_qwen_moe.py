@@ -1,30 +1,30 @@
 """
 train_qwen_moe.py
 ============================================================================
-数据：prepare_fineweb.py 产出的 train.bin / val.bin / meta.json（uint32）
-模型：model.py 里的 Qwen2ForCausalLM（MoE 魔改版）
+数据：scripts/prepare_fineweb.py 产出的 train.bin / val.bin / meta.json（uint32）
+模型：model.py（仓库根目录）里的 Qwen2ForCausalLM（MoE 魔改版）
 DeepSpeed：
-    bf16 混合精度          <-> ds_config.json 的 "bf16"
-    AdamW 优化器 + 权重衰减  <-> ds_config.json 的 "optimizer"
-    预热 + 余弦退火          <-> ds_config.json 的 "scheduler"
-    梯度累积（backward 自动按累积数缩放 loss）<-> ds_config.json 的 "gradient_accumulation_steps"
-    梯度裁剪                <-> ds_config.json 的 "gradient_clipping"
-    周期存档 / 断点续训       <-> ds_config.json 的 "checkpoint"
+    bf16 混合精度          <-> configs/ds_config.json 的 "bf16"
+    AdamW 优化器 + 权重衰减  <-> configs/ds_config.json 的 "optimizer"
+    预热 + 余弦退火          <-> configs/ds_config.json 的 "scheduler"
+    梯度累积（backward 自动按累积数缩放 loss）<-> configs/ds_config.json 的 "gradient_accumulation_steps"
+    梯度裁剪                <-> configs/ds_config.json 的 "gradient_clipping"
+    周期存档 / 断点续训       <-> configs/ds_config.json 的 "checkpoint"
 
-用法：
+用法（在仓库根目录下执行）：
     # 单卡冒烟（本机 4GB GPU，小模型）：
-    deepspeed --num_gpus=1 train_qwen_moe.py --deepspeed --deepspeed_config ds_config_tiny.json \
+    deepspeed --num_gpus=1 scripts/train_qwen_moe.py --deepspeed --deepspeed_config configs/ds_config_tiny.json \
         --tiny --block_size 256 --max_steps 50
 
     # 正式多卡训练（配置与默认 --max_steps 20000 配套）：
-    deepspeed --num_gpus=8 train_qwen_moe.py --deepspeed --deepspeed_config ds_config.json \
+    deepspeed --num_gpus=8 scripts/train_qwen_moe.py --deepspeed --deepspeed_config configs/ds_config.json \
         --hellaswag_every 1000 --hellaswag_samples 1000
 
     # 断点续训（DeepSpeed 自动恢复 model/optimizer/lr_scheduler/global_steps）：
-    deepspeed --num_gpus=8 train_qwen_moe.py --deepspeed --deepspeed_config ds_config.json --resume
+    deepspeed --num_gpus=8 scripts/train_qwen_moe.py --deepspeed --deepspeed_config configs/ds_config.json --resume
 
 注意：
-- --max_steps 必须与 ds_config.json 里 scheduler 的 total_num_steps 一致（脚本会警告）。
+- --max_steps 必须与 ds_config 里 scheduler 的 total_num_steps 一致（脚本会警告）。
 - micro_batch 是"每卡"的微批大小，全局有效批 = micro_batch × accum × num_gpus；
   多卡时记得相应调小 ds_config 里的 train_micro_batch_size_per_gpu。
 - 训练循环仍保留一个微批循环：DeepSpeed 无法替你决定一个数据块的边界，
@@ -37,6 +37,7 @@ DeepSpeed：
 import argparse
 import json
 import os
+import sys
 import time
 
 import numpy as np
@@ -44,6 +45,9 @@ import torch
 import torch.nn.functional as F
 
 import deepspeed
+
+# 脚本在 scripts/ 下，把仓库根目录加进 sys.path 才能 import 根目录的 model.py
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model import Qwen2Config, Qwen2ForCausalLM
 

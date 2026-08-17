@@ -68,6 +68,7 @@ class Qwen2Config:
     norm_topk_prob: bool = True  # 是否对 top-k 路由权重归一化（和为 1）
     use_aux_loss: bool = True  # 是否计算负载均衡辅助损失（MoE 训练稳定性的关键）
     aux_loss_coef: float = 0.01  # 辅助损失在总损失中的权重系数
+    ignore_index: int = -100  # 标签中不参与损失计算的 token id（SFT/DPO 用它掩码 prompt 与 padding）
 
 
 # ==================== 2. RMSNorm ====================
@@ -177,8 +178,9 @@ class Qwen2TopkRouter(nn.Module):
         self.top_k = config.num_experts_per_tok  # 每个 token 激活的专家数
         self.num_experts = config.num_local_experts  # 路由专家总数
         self.hidden_dim = config.hidden_size  # 路由输入的维度
-        # 路由权重：[num_experts, hidden]，每一行是一个专家的打分向量
-        self.weight = nn.Parameter(torch.zeros(self.num_experts, self.hidden_dim))
+        # 路由打分线性层：[num_experts, hidden]，每一行是一个专家的打分向量。
+        # 用 nn.Linear 而非裸 Parameter，便于 LoRA 等 PEFT 直接对路由打补丁。
+        self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
         self.routed_scaling_factor = config.routed_scaling_factor  # 输出缩放系数
         self.num_group = config.n_group  # 分组数
         self.topk_group = config.topk_group  # 放行的组数
@@ -190,7 +192,7 @@ class Qwen2TopkRouter(nn.Module):
     def forward(self, hidden_states):
         hidden_states = hidden_states.view(-1, self.hidden_dim)  # 展平成 [n_tokens, hidden]
         # 用 fp32 打分，避免低精度下 sigmoid 数值不稳定
-        router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))  # [n_tokens, num_experts]
+        router_logits = self.gate(hidden_states.type(torch.float32))  # [n_tokens, num_experts]（打分始终用 fp32）
         scores = router_logits.sigmoid()  # 每个专家独立打分（0~1）
         scores_for_choice = scores + self.e_score_correction_bias  # 加偏置后再用于"选择"
 
@@ -220,17 +222,36 @@ class Qwen2TopkRouter(nn.Module):
         return router_logits, topk_weights, topk_indices  # 返回 (原始logits, 权重, 专家id)
 
 
+class Qwen2Expert(nn.Module):
+    """单个路由专家：gate/up/down 三个 nn.Linear（SwiGLU）。
+
+    旧实现把专家权重打成三维裸 Parameter（gate_up_proj / down_proj），而 LoRA 等
+    PEFT 只认 nn.Linear；改成三个独立线性层后，可用 target_modules 直接打补丁。
+    数学上与"gate+up 拼一个线性再切半"完全等价（gate/up 就是旧张量的前后两半）。
+    """
+
+    def __init__(self, config: Qwen2Config):
+        super().__init__()  # 初始化父类
+        self.gate_proj = nn.Linear(config.hidden_size, config.moe_intermediate_size, bias=False)  # 门控投影
+        self.up_proj = nn.Linear(config.hidden_size, config.moe_intermediate_size, bias=False)  # 上投影
+        self.down_proj = nn.Linear(config.moe_intermediate_size, config.hidden_size, bias=False)  # 下投影
+
+    def forward(self, x):
+        # SwiGLU 核心公式：silu(gate(x)) * up(x)，再 down 投影回 hidden_size
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
 class Qwen2Experts(nn.Module):
-    """全部路由专家的权重打包成三维张量，逐个被命中的专家按 token 计算（DeepSeekV3 风格）"""
+    """全部路由专家（每个都是 nn.Linear 构成），逐个被命中的专家按 token 计算（DeepSeekV3 风格）"""
 
     def __init__(self, config: Qwen2Config):
         super().__init__()  # 初始化父类
         self.num_experts = config.num_local_experts  # 专家数
         self.hidden_dim = config.hidden_size  # 输入/输出维度
         self.intermediate_dim = config.moe_intermediate_size  # 每个专家的中间维度
-        # 三维权重 [num_experts, 2*mid, hidden]：每行的前一半是 gate、后一半是 up，一次线性后切半
-        self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
-        self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))  # [num_experts, hidden, mid]
+        self.experts = nn.ModuleList(  # ModuleList 让每个专家的参数都被注册进模型
+            [Qwen2Expert(config) for _ in range(self.num_experts)]
+        )
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
         """hidden_states: [n_tokens, hidden]; 返回同形状的加权专家输出"""
@@ -245,9 +266,7 @@ class Qwen2Experts(nn.Module):
             # top_k_pos: 该 token 是第几个被选槽位；token_idx: 哪些 token 选了这个专家
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[token_idx]  # 取出这批 token 的输入
-            gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)  # 一次算 gate/up 再切半
-            current_hidden_states = F.silu(gate) * up  # SwiGLU 激活
-            current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx])  # down 投影
+            current_hidden_states = self.experts[expert_idx](current_state)  # 该专家一次 SwiGLU
             current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]  # 乘路由权重
             final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))  # 累加回对应位置
 
@@ -320,6 +339,7 @@ class Qwen2Attention(nn.Module):
         position_embeddings: tuple,  # 预计算的 (cos, sin) 表
         past_key_value: tuple | None = None,  # 该层历史的 (K, V) 缓存
         use_cache: bool = False,  # 是否返回更新后的缓存
+        attention_mask: torch.Tensor | None = None,  # [batch, seq] 的 0/1（1=真实 token），用于屏蔽 padding
     ):
         bsz, q_len, _ = hidden_states.shape  # batch 大小、当前 query 序列长度
         # 三个投影 + 拆成多头 + 头维度移到第 1 维（位置在倒数第 2 维）
@@ -345,9 +365,12 @@ class Qwen2Attention(nn.Module):
         # （兼容两种场景：prefill 时 q_len==kv_len 退化为标准下三角；解码时 q_len==1 全部放行）
         kv_len = key_states.shape[-2]  # 完整 key 序列长度
         q_start = kv_len - q_len  # 本次 query 的绝对起始位置（生成时 kv_len>q_len，起始位置非 0）
-        allowed = (torch.arange(q_len, device=query_states.device)[:, None] + q_start) >= torch.arange(
+        allowed = (torch.arange(q_len, device=query_states.device)[None, None, :, None] + q_start) >= torch.arange(
             kv_len, device=query_states.device
-        )[None, :]
+        )[None, None, None, :]  # [1, 1, q_len, kv_len]
+        allowed = allowed.expand(bsz, 1, -1, -1)  # 补上 batch 维 -> [batch, 1, q_len, kv_len]
+        if attention_mask is not None:  # [batch, kv_len]，1=真实、0=padding
+            allowed = allowed & attention_mask.bool()[:, None, None, :]  # [batch, 1, 1, kv_len] 广播合并
 
         if self.config.use_sdpa:  #FlashAttention
             # SDPA 返回的是"已和 V 加权求和"的最终输出
@@ -363,8 +386,8 @@ class Qwen2Attention(nn.Module):
             )
         else:  #手写Attention
             attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) * self.scaling  # 缩放点积
-            causal = ~allowed  # True=未来位置，需要屏蔽
-            attn_weights = attn_weights.masked_fill(causal[None, None], float("-inf"))  # 未来位置填 -inf
+            causal = ~allowed  # [batch, 1, q_len, kv_len]，True=需屏蔽（未来 或 padding 位置）
+            attn_weights = attn_weights.masked_fill(causal, float("-inf"))  # 广播到所有头
             # 用 float32 做 softmax 提升数值稳定性，再转回原精度
             attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
             attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)  # 训练时对注意力权重做 dropout
@@ -398,11 +421,12 @@ class Qwen2DecoderLayer(nn.Module):
         position_embeddings: tuple,  # cos/sin
         past_key_value: tuple | None = None,  # 该层 KV 缓存
         use_cache: bool = False,  # 缓存开关
+        attention_mask: torch.Tensor | None = None,  # [batch, seq] 0/1，透传给注意力
     ):
         residual = hidden_states  # 保存残差（Pre-Norm：先归一化再进子层）
         hidden_states = self.input_layernorm(hidden_states)  # 第一步归一化
         hidden_states, present = self.self_attn(  # 自注意力
-            hidden_states, position_embeddings, past_key_value, use_cache  # 透传缓存
+            hidden_states, position_embeddings, past_key_value, use_cache, attention_mask  # 透传缓存与掩码
         )
         hidden_states = residual + hidden_states  # 注意力残差连接
         residual = hidden_states  # 再次保存残差
@@ -438,6 +462,7 @@ class Qwen2Model(nn.Module):
         position_ids: torch.LongTensor | None = None,  # 位置 id（不传则自动计算）
         past_key_values: list | None = None,  # 各层的 KV 缓存列表，长度 = 层数
         use_cache: bool = False,  # 是否返回缓存
+        attention_mask: torch.Tensor | None = None,  # [batch, seq] 0/1，透传给各层注意力
     ):
         batch, seq_len = input_ids.shape  # batch 大小、序列长度
         hidden_states = self.embed_tokens(input_ids)  # 查嵌入表 -> [batch, seq, hidden_size]
@@ -458,7 +483,7 @@ class Qwen2Model(nn.Module):
         total_aux_loss = torch.tensor(0.0, device=input_ids.device)  # 累加所有 MoE 层的辅助损失
         for i, layer in enumerate(self.layers):  # 逐层前向
             pv = None if past_key_values is None else past_key_values[i]  # 取该层的历史缓存
-            hidden_states, present, aux_loss = layer(hidden_states, position_embeddings, pv, use_cache)  # 前向一层
+            hidden_states, present, aux_loss = layer(hidden_states, position_embeddings, pv, use_cache, attention_mask)  # 前向一层
             total_aux_loss = total_aux_loss + aux_loss  # 累加辅助损失
             if use_cache:  # 需要缓存时记录
                 presents.append(present)  # 存下该层更新后的 K/V
@@ -487,12 +512,9 @@ class Qwen2ForCausalLM(nn.Module):
                     nn.init.zeros_(module.bias)  # bias 初始化为 0
             elif isinstance(module, nn.Embedding):  # 嵌入表
                 nn.init.normal_(module.weight, mean=0.0, std=self.config.initial_range)  # 同样是 N(0, 0.02)
-            elif isinstance(module, Qwen2TopkRouter):  # MoE 路由权重（专家打分向量）
-                nn.init.normal_(module.weight, mean=0.0, std=self.config.initial_range)
-                nn.init.zeros_(module.e_score_correction_bias)  # 负载均衡偏置置 0
-            elif isinstance(module, Qwen2Experts):  # MoE 专家的三维权重（不是 nn.Linear，需单独初始化）
-                nn.init.normal_(module.gate_up_proj, mean=0.0, std=self.config.initial_range)
-                nn.init.normal_(module.down_proj, mean=0.0, std=self.config.initial_range)
+            # 注意：Router 的 self.gate 与 Expert 的 gate/up/down_proj 现在都是 nn.Linear，
+            # 上面的 nn.Linear 分支会统一初始化成 N(0, initial_range)，无需再单独处理；
+            # e_score_correction_bias 是构造时注册的零 buffer，也无需重置。
         if self.config.tie_word_embeddings:  # 若开启权重共享（Qwen2 默认开启）
             # 让 lm_head 与 embed_tokens 指向同一个 Parameter 对象（节省 ~136M 参数）
             self.lm_head.weight = self.model.embed_tokens.weight
@@ -504,8 +526,9 @@ class Qwen2ForCausalLM(nn.Module):
         past_key_values: list | None = None,  # KV 缓存
         use_cache: bool = False,  # 缓存开关
         labels: torch.LongTensor | None = None,  # 训练标签（可选，用于计算损失）
+        attention_mask: torch.Tensor | None = None,  # [batch, seq] 0/1，透传给主干（屏蔽 padding）
     ):
-        hidden_states, presents, aux_loss = self.model(input_ids, position_ids, past_key_values, use_cache)  # 主干前向
+        hidden_states, presents, aux_loss = self.model(input_ids, position_ids, past_key_values, use_cache, attention_mask)  # 主干前向
         logits = self.lm_head(hidden_states)  # 映射到词表 -> [batch, seq, vocab_size]
 
         loss = None  # 默认无损失
@@ -516,6 +539,7 @@ class Qwen2ForCausalLM(nn.Module):
             lm_loss = F.cross_entropy(  # 交叉熵损失
                 shift_logits.view(-1, self.config.vocab_size),  # 展平成 [N, vocab]
                 shift_labels.view(-1),  # 展平成 [N]
+                ignore_index=self.config.ignore_index,  # 跳过 -100（SFT 的 prompt / padding 位置）
             )
             # 总损失 = 语言建模损失 + 负载均衡辅助损失（MoE 训练稳定性的关键）
             loss = lm_loss + self.config.aux_loss_coef * aux_loss
@@ -582,6 +606,15 @@ if __name__ == "__main__":
     ids = torch.randint(0, config.vocab_size, (1, 8))  # 随机 token 序列 [1, 8]
     loss, logits, past = model(ids, labels=ids, use_cache=True)  # 前向（含损失、缓存）
     print("logits:", tuple(logits.shape), "| loss:", round(loss.item(), 4))  # 打印输出形状与损失
+
+    # 带 padding 与 ignore_index 的批次前向（SFT/DPO 会用：labels 里 -100 的位置不参与损失）
+    ids2 = torch.randint(0, config.vocab_size, (2, 8))  # [2, 8] 一批
+    am = torch.ones(2, 8, dtype=torch.long)  # 注意力掩码
+    am[:, 6:] = 0  # 后两位是 padding
+    y2 = ids2.clone()  # 标签
+    y2[:, :4] = config.ignore_index  # 前 4 位 prompt 掩掉（不参与损失）
+    loss2, logits2, _ = model(ids2, labels=y2, attention_mask=am)
+    print("pad-batch loss:", round(loss2.item(), 4), "| logits:", tuple(logits2.shape))
 
     # 生成测试：给 3 个 token 作为 prompt，生成 5 个新 token
     out = model.generate(torch.tensor([[0, 1, 2]]), max_new_tokens=5, eos_token_id=None)

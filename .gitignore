@@ -7,6 +7,7 @@ data/
 # ---------- 训练输出 / 检查点 ----------
 out-qwen-moe/
 out-qwen-moe-tiny/
+saves/
 *.ckpt
 *.pt
 *.safetensors
